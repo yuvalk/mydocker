@@ -14,6 +14,7 @@ from __future__ import print_function
 import os
 import uuid
 import click
+import linux
 import tarfile
 
 
@@ -43,6 +44,30 @@ def create_container_root(image_name, image_dir, container_id, container_dir):
 
 
 def contain(command, image, image_dir, container_id, containers_dir):
+    new_root = create_container_root(image, image_dir, container_id, containers_dir)
+    print('Created a new root fs for our container: {}'.format(new_root))
+
+    # TODO: time to say goodbye to the old mount namespace, see "man 2 unshare" to get some help
+    #   HINT 1: there is no os.unshare(), time to use the linux module we made just for you!
+    #   HINT 2: the linux module include both functions and constants! e.g. linux.CLONE_NEWNS
+
+    # TODO: remember shared subtrees? (https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt)
+    #       remount / as a private mount to avoid littering our host mount table
+
+    # Create mounts (/proc, /sys, /dev) under new_root
+    linux.mount('proc', os.path.join(new_root, 'proc'), 'proc', 0, '')
+    linux.mount('sysfs', os.path.join(new_root, 'sys'), 'sysfs', 0, '')
+    linux.mount('tmpfs', os.path.join(new_root, 'dev'), 'tmpfs',
+        linux.MS_NOSUID | linux.MS_STRICTATIME, 'mode=755')
+    # Add some basic devices
+    devpts_path = os.path.join(new_root, 'dev', 'pts')
+    if not os.path.exists(devpts_path):
+        os.makedirs(devpts_path)
+        linux.mount('devpts', devpts_path, 'devpts', 0, '')
+    for i, dev in enumerate(['stdin', 'stdout', 'stderr']):
+        os.symlink('/proc/self/fd/%d' % i, os.path.join(new_root, 'dev', dev))
+
+    # TODO: add more device (e.g. null, zero, random, urandom) using os.mknode
     new_root = create_container_root(image, image_dir, container_id, containers_dir)
 
     os.chroot(new_root)
