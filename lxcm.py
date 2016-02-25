@@ -12,6 +12,7 @@
 from __future__ import print_function
 
 import os
+import stat
 import uuid
 import click
 import linux
@@ -30,17 +31,46 @@ def _get_container_path(container_id, container_dir, *subdir_modules):
 
 def create_container_root(image_name, image_dir, container_id, container_dir):
     image_path = _get_image_path(image_name, image_dir)
-    container_root = _get_container_path(container_id, container_dir, 'rootfs')
+    image_root = os.path.join(image_dir, image_name, 'rootfs')
 
     assert os.path.exists(image_path), "unable to locate image %s" % image_name
 
-    if not os.path.exists(container_root):
-        os.makedirs(container_root)
+    if not os.path.exists(image_root):
+        os.makedirs(image_root)
+        with tarfile.open(image_path) as t:
+            # Fun fact: tar files may contain *nix devices! *facepalm*
+            t.extractall(image_root,
+                         members=[m for m in t.getmembers() if m.type not in (tarfile.CHRTYPE, tarfile.BLKTYPE)])
 
-    with tarfile.open(image_path) as t:
-        t.extractall(container_root, members=[m for m in t.getmembers() if m.type not in (tarfile.CHRTYPE, tarfile.BLKTYPE)])
+    # create directories for copy-on-write (uppperdir), overlay workdir, and a mount point
+    container_cow_rw = _get_container_path(container_id, container_dir, 'cow_rw')
+    container_cow_workdir = _get_container_path(container_id, container_dir, 'cow_workdir')
+    container_rootfs = _get_container_path(container_id, container_dir, 'rootfs')
+    for d in (container_cow_rw, container_cow_workdir, container_rootfs):
+        if not os.path.exists(d):
+            os.makedirs(d)
 
-    return container_root
+            # mount the overlay (HINT: use the MS_NODEV flag to mount)
+    linux.mount('overlay', container_rootfs, 'overlay',
+                linux.MS_NODEV,
+                "lowerdir={image_root},upperdir={cow_rw},workdir={cow_workdir}".format(
+                    image_root=image_root,
+                    cow_rw=container_cow_rw,
+                    cow_workdir=container_cow_workdir))
+
+    return container_rootfs  # return the mountpoint for the overlayfs
+
+def makedev(dev_path):
+    for i, dev in enumerate(['stdin', 'stdout', 'stderr']):
+        os.symlink('/proc/self/fd/%d' % i, os.path.join(dev_path, dev))
+    os.symlink('/proc/self/fd', os.path.join(dev_path, 'fd'))
+    # Add extra devices
+    DEVICES = {'null': (stat.S_IFCHR, 1, 3), 'zero': (stat.S_IFCHR, 1, 5),
+               'random': (stat.S_IFCHR, 1, 8), 'urandom': (stat.S_IFCHR, 1, 9),
+               'console': (stat.S_IFCHR, 136, 1), 'tty': (stat.S_IFCHR, 5, 0),
+               'full': (stat.S_IFCHR, 1, 7)}
+    for device, (dev_type, major, minor) in DEVICES.iteritems():
+        os.mknod(os.path.join(dev_path, device), 0666 | dev_type, os.makedev(major, minor))
 
 
 def contain(command, image, image_dir, container_id, containers_dir):
@@ -50,31 +80,27 @@ def contain(command, image, image_dir, container_id, containers_dir):
     new_root = create_container_root(image, image_dir, container_id, containers_dir)
     print('Created a new root fs for our container: {}'.format(new_root))
 
-    # TODO: time to say goodbye to the old mount namespace, see "man 2 unshare" to get some help
-    #   HINT 1: there is no os.unshare(), time to use the linux module we made just for you!
-    #   HINT 2: the linux module include both functions and constants! e.g. linux.CLONE_NEWNS
-
-    # TODO: remember shared subtrees? (https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt)
-    #       remount / as a private mount to avoid littering our host mount table
-
     # Create mounts (/proc, /sys, /dev) under new_root
     linux.mount('proc', os.path.join(new_root, 'proc'), 'proc', 0, '')
     linux.mount('sysfs', os.path.join(new_root, 'sys'), 'sysfs', 0, '')
     linux.mount('tmpfs', os.path.join(new_root, 'dev'), 'tmpfs',
-        linux.MS_NOSUID | linux.MS_STRICTATIME, 'mode=755')
+                linux.MS_NOSUID | linux.MS_STRICTATIME, 'mode=755')
+
     # Add some basic devices
     devpts_path = os.path.join(new_root, 'dev', 'pts')
     if not os.path.exists(devpts_path):
         os.makedirs(devpts_path)
         linux.mount('devpts', devpts_path, 'devpts', 0, '')
-    for i, dev in enumerate(['stdin', 'stdout', 'stderr']):
-        os.symlink('/proc/self/fd/%d' % i, os.path.join(new_root, 'dev', dev))
 
-    # TODO: add more device (e.g. null, zero, random, urandom) using os.mknode
-    new_root = create_container_root(image, image_dir, container_id, containers_dir)
+    makedev(os.path.join(new_root, 'dev'))
 
-    os.chroot(new_root)
+    old_root = os.path.join(new_root, 'old_root')
+    os.makedirs(old_root)
+    linux.pivot_root(new_root, old_root)
+
     os.chdir('/')
+    linux.umount2('/old_root', linux.MNT_DETACH)
+
     os.execvp(command[0], command)
 
 
